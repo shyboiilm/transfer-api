@@ -2,7 +2,7 @@ const DEFAULT_UPSTREAM_BASE_URL = "https://unlimited.surf";
 const DEFAULT_OPENAI_MODEL = "gateway-gpt-5-5";
 const DEFAULT_CLAUDE_MODEL = "claude-opus-4-7-20260101";
 
-const UPSTREAM_MAX_ATTEMPTS = 8;
+const UPSTREAM_MAX_ATTEMPTS = 6;
 const UPSTREAM_RETRY_BASE_DELAY_MS = 300;
 const UPSTREAM_RETRY_MAX_DELAY_MS = 4000;
 const UPSTREAM_PEEK_TIMEOUT_MS = 20000;
@@ -585,43 +585,23 @@ async function probeUnlimitedStream(response) {
 }
 
 async function collectUnlimitedText(request, env, path, payload) {
-  let lastError = null;
-  for (let attempt = 1; attempt <= UPSTREAM_MAX_ATTEMPTS; attempt += 1) {
-    const probed = await callUnlimitedStream(request, env, path, payload);
-    const events = await drainUnlimitedEvents(probed);
-    let text = "";
-    let finishReason = "stop";
-    const annotations = [];
+  const probed = await callUnlimitedStream(request, env, path, payload);
+  const events = await drainUnlimitedEvents(probed);
+  let text = "";
+  let finishReason = "stop";
+  const annotations = [];
 
-    for (const event of events) {
-      const upstreamError = extractUpstreamError(event);
-      if (upstreamError) {
-        lastError = new UpstreamError(upstreamError, 502, true);
-        text = "";
-        break;
-      }
-      if (typeof event.delta === "string") text += event.delta;
-      if (event.results) annotations.push(event.results);
-      if (event.finish && event.reason) finishReason = event.reason;
+  for (const event of events) {
+    const upstreamError = extractUpstreamError(event);
+    if (upstreamError) {
+      throw new UpstreamError(upstreamError, 502, true);
     }
-
-    if (lastError) {
-      if (attempt >= UPSTREAM_MAX_ATTEMPTS) break;
-      await sleep(retryBackoffDelay(attempt));
-      continue;
-    }
-
-    if (!text && finishReason === "stop") {
-      if (attempt >= UPSTREAM_MAX_ATTEMPTS) {
-        return { text: "", finishReason, annotations, rawEvents: events, isEmpty: true };
-      }
-      await sleep(retryBackoffDelay(attempt));
-      continue;
-    }
-
-    return { text, finishReason, annotations, rawEvents: events };
+    if (typeof event.delta === "string") text += event.delta;
+    if (event.results) annotations.push(event.results);
+    if (event.finish && event.reason) finishReason = event.reason;
   }
-  throw lastError || new Error(`upstream ${path} produced empty result after ${UPSTREAM_MAX_ATTEMPTS} attempts`);
+
+  return { text, finishReason, annotations, rawEvents: events, isEmpty: !text };
 }
 
 async function drainUnlimitedEvents(probed) {
