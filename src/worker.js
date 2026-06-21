@@ -1,11 +1,10 @@
 const DEFAULT_UPSTREAM_BASE_URL = "https://unlimited.surf";
-const DEFAULT_OPENAI_MODEL = "gateway-gpt-5-5";
+const DEFAULT_OPENAI_MODEL = "gateway-gpt-5";
 const DEFAULT_CLAUDE_MODEL = "claude-opus-4-7-20260101";
 
 const UPSTREAM_MAX_ATTEMPTS = 6;
 const UPSTREAM_RETRY_BASE_DELAY_MS = 300;
 const UPSTREAM_RETRY_MAX_DELAY_MS = 4000;
-const UPSTREAM_PEEK_TIMEOUT_MS = 20000;
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -57,9 +56,6 @@ export default {
 
       return errorResponse(404, "not_found", `No route for ${path}`);
     } catch (error) {
-      if (error && error.name === "UpstreamError") {
-        return errorResponse(error.status || 502, "upstream_error", `${error.message} (after ${UPSTREAM_MAX_ATTEMPTS} attempts)`);
-      }
       return errorResponse(500, "internal_error", error && error.message ? error.message : String(error));
     }
   },
@@ -466,21 +462,38 @@ async function proxyUpstream(request, env, path) {
 }
 
 async function callUnlimitedJson(request, env, path, payload) {
+  const response = await fetch(new URL(path, upstreamBase(env)), {
+    method: "POST",
+    headers: upstreamHeaders(request, env, false),
+    body: JSON.stringify(payload || {}),
+  });
+
+  if (!response.ok) {
+    throw new Error(`upstream ${path} failed: ${response.status} ${await response.text()}`);
+  }
+
+  return response.json();
+}
+
+async function callUnlimitedStreamOnce(request, env, path, payload) {
+  const response = await fetch(new URL(path, upstreamBase(env)), {
+    method: "POST",
+    headers: upstreamHeaders(request, env, true),
+    body: JSON.stringify(payload || {}),
+  });
+
+  if (!response.ok) {
+    throw new Error(`upstream ${path} failed: ${response.status} ${await safeReadText(response)}`);
+  }
+
+  return response;
+}
+
+async function callUnlimitedStream(request, env, path, payload) {
   let lastError = null;
   for (let attempt = 1; attempt <= UPSTREAM_MAX_ATTEMPTS; attempt += 1) {
     try {
-      const response = await fetch(new URL(path, upstreamBase(env)), {
-        method: "POST",
-        headers: upstreamHeaders(request, env, false),
-        body: JSON.stringify(payload || {}),
-      });
-
-      if (!response.ok) {
-        const bodyText = await safeReadText(response);
-        throw new UpstreamError(`upstream ${path} failed: ${response.status} ${bodyText}`, response.status);
-      }
-
-      return await response.json();
+      return await callUnlimitedStreamOnce(request, env, path, payload);
     } catch (error) {
       lastError = error;
       if (attempt >= UPSTREAM_MAX_ATTEMPTS) break;
@@ -490,155 +503,63 @@ async function callUnlimitedJson(request, env, path, payload) {
   throw lastError || new Error(`upstream ${path} failed after ${UPSTREAM_MAX_ATTEMPTS} attempts`);
 }
 
-async function callUnlimitedStream(request, env, path, payload) {
+function extractUpstreamError(event) {
+  if (!event || typeof event !== "object") return null;
+  if (event.error) {
+    if (typeof event.error === "string") return event.error;
+    if (typeof event.error === "object" && event.error !== null) {
+      return event.error.message || event.error.error || JSON.stringify(event.error);
+    }
+  }
+  if (typeof event.errorMessage === "string" && event.errorMessage) return event.errorMessage;
+  if (typeof event.message === "string" && /error|fail|websocket|timeout/i.test(event.message)) {
+    return event.message;
+  }
+  return null;
+}
+
+async function collectUnlimitedText(request, env, path, payload) {
   let lastError = null;
   for (let attempt = 1; attempt <= UPSTREAM_MAX_ATTEMPTS; attempt += 1) {
-    const response = await fetch(new URL(path, upstreamBase(env)), {
-      method: "POST",
-      headers: upstreamHeaders(request, env, true),
-      body: JSON.stringify(payload || {}),
-    });
+    const response = await callUnlimitedStream(request, env, path, payload);
+    const events = await readUnlimitedEvents(response);
+    let text = "";
+    let finishReason = "stop";
+    const annotations = [];
+    let hadError = false;
 
-    if (!response.ok) {
-      const bodyText = await safeReadText(response);
-      lastError = new UpstreamError(`upstream ${path} failed: ${response.status} ${bodyText}`, response.status);
+    for (const event of events) {
+      const upstreamError = extractUpstreamError(event);
+      if (upstreamError) {
+        lastError = new Error(upstreamError);
+        hadError = true;
+        text = "";
+        break;
+      }
+      if (typeof event.delta === "string") text += event.delta;
+      if (event.results) annotations.push(event.results);
+      if (event.finish && event.reason) finishReason = event.reason;
+    }
+
+    if (hadError) {
       if (attempt >= UPSTREAM_MAX_ATTEMPTS) break;
       await sleep(retryBackoffDelay(attempt));
       continue;
     }
 
-    try {
-      const probed = await probeUnlimitedStream(response);
-      if (probed.ok) {
-        return probed;
-      }
-      lastError = new UpstreamError(probed.errorMessage || `upstream ${path} stream failed`, 502, true);
-      try { probed.reader.cancel(); } catch (_) { /* noop */ }
+    if (!text) {
       if (attempt >= UPSTREAM_MAX_ATTEMPTS) break;
       await sleep(retryBackoffDelay(attempt));
-    } catch (error) {
-      lastError = error instanceof UpstreamError ? error : new UpstreamError(error.message || String(error), 502, true);
-      if (attempt >= UPSTREAM_MAX_ATTEMPTS) break;
-      await sleep(retryBackoffDelay(attempt));
+      continue;
     }
-  }
-  throw lastError || new Error(`upstream ${path} stream failed after ${UPSTREAM_MAX_ATTEMPTS} attempts`);
-}
 
-async function probeUnlimitedStream(response) {
-  if (!response.body || !response.body.getReader) {
-    throw new UpstreamError("upstream returned no readable body", 502, true);
+    return { text, finishReason, annotations, rawEvents: events };
   }
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  const deadline = Date.now() + UPSTREAM_PEEK_TIMEOUT_MS;
-  let buffer = "";
-  let firstDeltaIndex = -1;
-  const collectedLines = [];
-
-  while (Date.now() < deadline) {
-    const readResult = await reader.read();
-    if (readResult.done) break;
-    buffer += decoder.decode(readResult.value, { stream: true });
-
-    const lines = buffer.split(/\r?\n/);
-    buffer = lines.pop() || "";
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      collectedLines.push(line);
-
-      if (trimmed.startsWith("data:")) {
-        const parsed = parseSseJson(trimmed.slice(5).trim());
-        if (!parsed) continue;
-
-        const upstreamError = extractUpstreamError(parsed);
-        if (upstreamError) {
-          return { ok: false, errorMessage: upstreamError, reader, bufferedLines: collectedLines };
-        }
-
-        if (typeof parsed.delta === "string" && parsed.delta.length) {
-          firstDeltaIndex = collectedLines.length - 1;
-          return { ok: true, reader, bufferedLines: collectedLines };
-        }
-
-        if (parsed.finish || parsed.done) {
-          return { ok: false, errorMessage: "upstream finished without producing content", reader, bufferedLines: collectedLines };
-        }
-      }
-    }
+  if (lastError) {
+    throw new Error(`upstream ${path} failed after ${UPSTREAM_MAX_ATTEMPTS} attempts: ${lastError.message}`);
   }
-
-  if (firstDeltaIndex === -1) {
-    const tail = collectedLines.slice(-8).join(" | ").slice(0, 500);
-    return {
-      ok: false,
-      errorMessage: tail ? `upstream produced no content (tail: ${tail})` : "upstream produced no content before timeout",
-      reader,
-      bufferedLines: collectedLines,
-    };
-  }
-
-  return { ok: true, reader, bufferedLines: collectedLines };
-}
-
-async function collectUnlimitedText(request, env, path, payload) {
-  const probed = await callUnlimitedStream(request, env, path, payload);
-  const events = await drainUnlimitedEvents(probed);
-  let text = "";
-  let finishReason = "stop";
-  const annotations = [];
-
-  for (const event of events) {
-    const upstreamError = extractUpstreamError(event);
-    if (upstreamError) {
-      throw new UpstreamError(upstreamError, 502, true);
-    }
-    if (typeof event.delta === "string") text += event.delta;
-    if (event.results) annotations.push(event.results);
-    if (event.finish && event.reason) finishReason = event.reason;
-  }
-
-  return { text, finishReason, annotations, rawEvents: events, isEmpty: !text };
-}
-
-async function drainUnlimitedEvents(probed) {
-  const decoder = new TextDecoder();
-  const events = [];
-  const pending = (probed.bufferedLines || []).slice();
-
-  for (const line of pending) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith("data:")) continue;
-    const parsed = parseSseJson(trimmed.slice(5).trim());
-    if (parsed) events.push(parsed);
-  }
-
-  const reader = probed.reader;
-  if (!reader) return events;
-
-  let buffer = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split(/\r?\n/);
-    buffer = lines.pop() || "";
-    for (const line of lines) {
-      if (!line.trim().startsWith("data:")) continue;
-      const parsed = parseSseJson(line.slice(5).trim());
-      if (parsed) events.push(parsed);
-    }
-  }
-
-  if (buffer.trim().startsWith("data:")) {
-    const parsed = parseSseJson(buffer.trim().slice(5).trim());
-    if (parsed) events.push(parsed);
-  }
-
-  return events;
+  return { text: "", finishReason: "stop", annotations: [], rawEvents: [] };
 }
 
 async function getModelCatalog(request, env) {
@@ -810,49 +731,31 @@ function streamUnlimitedEvents(upstream, handlers) {
       let finished = false;
       handlers.start && handlers.start(controller);
 
-      const isProbed = upstream && upstream.reader;
-      const reader = isProbed ? upstream.reader : (upstream && upstream.body ? upstream.body.getReader() : null);
-      const bufferedLines = isProbed ? (upstream.bufferedLines || []) : [];
-      let buffer = "";
-
-      const processLine = (line) => {
-        if (!line || !line.startsWith("data:")) return;
-        const parsed = parseSseJson(line.slice(5).trim());
-        if (!parsed) return;
-
-        const upstreamError = extractUpstreamError(parsed);
-        if (upstreamError) {
-          controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ error: upstreamError })}\n\n`));
-          finished = true;
-          try { handlers.finish && handlers.finish(controller, "stop", parsed); } catch (_) { /* noop */ }
-          return;
-        }
-
-        if (typeof parsed.delta === "string" && parsed.delta.length) {
-          handlers.delta && handlers.delta(controller, parsed.delta, parsed);
-        }
-
-        if (parsed.finish || parsed.done) {
-          finished = true;
-          handlers.finish && handlers.finish(controller, parsed.reason || "stop", parsed);
-        }
-      };
-
       try {
-        for (const line of bufferedLines) processLine(line);
+        const reader = upstream.body.getReader();
+        let buffer = "";
 
-        if (!reader) {
-          if (!finished) handlers.finish && handlers.finish(controller, "stop", {});
-        } else {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split(/\r?\n/);
-            buffer = lines.pop() || "";
-            for (const line of lines) processLine(line);
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split(/\r?\n/);
+          buffer = lines.pop() || "";
+
+          for (const line of lines) {
+            if (!line.startsWith("data:")) continue;
+            const parsed = parseSseJson(line.slice(5).trim());
+            if (!parsed) continue;
+
+            if (typeof parsed.delta === "string" && parsed.delta.length) {
+              handlers.delta && handlers.delta(controller, parsed.delta, parsed);
+            }
+
+            if (parsed.finish || parsed.done) {
+              finished = true;
+              handlers.finish && handlers.finish(controller, parsed.reason || "stop", parsed);
+            }
           }
-          if (buffer.trim().startsWith("data:")) processLine(buffer.trim());
         }
 
         if (!finished) handlers.finish && handlers.finish(controller, "stop", {});
@@ -1166,33 +1069,6 @@ function parseSseJson(data) {
   } catch (_) {
     return null;
   }
-}
-
-class UpstreamError extends Error {
-  constructor(message, status, retryable = true) {
-    super(message);
-    this.name = "UpstreamError";
-    this.status = status || 502;
-    this.retryable = retryable;
-  }
-}
-
-function extractUpstreamError(event) {
-  if (!event || typeof event !== "object") return null;
-  if (event.error) {
-    if (typeof event.error === "string") return event.error;
-    if (typeof event.error === "object" && event.error !== null) {
-      return event.error.message || event.error.error || JSON.stringify(event.error);
-    }
-  }
-  if (typeof event.errorMessage === "string" && event.errorMessage) return event.errorMessage;
-  if (typeof event.message === "string" && /error|fail|websocket|timeout/i.test(event.message)) {
-    return event.message;
-  }
-  if (typeof event.status === "string" && /error|fail/i.test(event.status)) {
-    return `upstream status: ${event.status}`;
-  }
-  return null;
 }
 
 function retryBackoffDelay(attempt) {
